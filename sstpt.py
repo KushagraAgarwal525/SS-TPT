@@ -1,4 +1,5 @@
 import argparse
+import json
 import time
 from copy import deepcopy
 from PIL import Image
@@ -26,6 +27,12 @@ from clip.custom_clip import get_coop
 from data.imagnet_prompts import imagenet_classes
 from data.datautils import AugMixAugmenter, build_dataset
 from utils.tools import Summary, AverageMeter, ProgressMeter, accuracy, load_model_weight, set_random_seed
+from utils.instance_alpha import (
+    ALPHA_MODES,
+    combine_ss,
+    compute_instance_alpha,
+    compute_instance_alpha_details,
+)
 from data.cls_to_names import *
 from data.fewshot_datasets import fewshot_datasets
 from data.imagenet_variants import thousand_k_to_200, imagenet_a_mask, imagenet_r_mask, imagenet_v_mask
@@ -242,7 +249,7 @@ def self_consistency_loss_with_rs_view(outputs, weight, ref_mode):
     
     return kl
 
-def test_time_tuning(model, inputs, suit_score, stab_score, optimizer, scaler, args, idx):
+def test_time_tuning(model, inputs, suit_score, stab_score, optimizer, scaler, args, idx, alpha):
     selected_idx = None
 
     for j in range(args.tta_steps):
@@ -259,7 +266,7 @@ def test_time_tuning(model, inputs, suit_score, stab_score, optimizer, scaler, a
         
         suit_n  = (sel_suit_score  - sel_suit_score.min())  / (sel_suit_score.max()  - sel_suit_score.min()  + 1e-8)
         stab_n = (sel_stab_score - sel_stab_score.min()) / (sel_stab_score.max() - sel_stab_score.min() + 1e-8)
-        score = args.ss_ratio * suit_n + (1-args.ss_ratio) * stab_n
+        score = combine_ss(suit_n, stab_n, alpha)
         weight_cons = torch.nn.functional.softmax(score/args.temp, dim=-1)
         
         ent_loss = entropy_avg(output)
@@ -289,13 +296,14 @@ def main():
         args.alpha = args.eps / 4.0
     safe_arch = args.arch.replace('/', '_')
     args.output_dir = os.path.join(args.output_dir, safe_arch, args.test_sets, 'eps_'+str(args.eps)+'_alpha_'+str(args.alpha)+'_step_'+str(args.steps)
-                                   +'_batchsize_'+str(args.batch_size))
+                                   +'_batchsize_'+str(args.batch_size)+'_am_'+str(args.alpha_mode))
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     args.out_file = open(os.path.join(args.output_dir, 'log.txt'), 'w')
     args.out_file.write(print_args(args)+'\n')
     args.out_file.flush()
+    args.alpha_trace_file = open(os.path.join(args.output_dir, 'alpha_trace.jsonl'), 'w')
 
     assert args.gpu is not None
 
@@ -371,6 +379,9 @@ def main():
         batchsize = 1
 
         val_dataset = build_dataset(dset, data_transform, args.data, mode=args.dataset_mode)
+        if args.max_samples > 0:
+            n_keep = min(args.max_samples, len(val_dataset))
+            val_dataset = torch.utils.data.Subset(val_dataset, range(n_keep))
         print("number of test samples: {}".format(len(val_dataset)))
         val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batchsize, shuffle=False,
                     num_workers=args.workers, pin_memory=True)
@@ -385,6 +396,7 @@ def main():
         args.out_file.flush()
         
         result = test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state, scaler, args, data_transform)
+        args.alpha_trace_file.close()
         del val_dataset, val_loader
         if args.eps <= 0:
             print_log = "=> Acc. on testset [{}]: SSTPT Clean Acc @1 {}".format(dset, result)
@@ -490,13 +502,32 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
         )
 
         assert args.tta_steps > 0
-        test_time_tuning(model, images, suit_score.detach(), stab_score.detach(), optimizer, scaler, args, i)
+        suit_n_all = (suit_score - suit_score.min()) / (suit_score.max() - suit_score.min() + 1e-8)
+        stab_n_all = (stab_score - stab_score.min()) / (stab_score.max() - stab_score.min() + 1e-8)
+        # One shared α per image from all-view min-max scores, reused in test_time_tuning.
+        alpha = compute_instance_alpha(
+            suit_n_all, stab_n_all,
+            mode=args.alpha_mode,
+            fixed_alpha=args.ss_ratio,
+            temp=args.temp,
+            topk=args.num_select,
+            suit_raw=suit_score,
+            stab_raw=stab_score,
+        )
+        _, r_suit, r_stab = compute_instance_alpha_details(
+            suit_n_all, stab_n_all,
+            mode=args.alpha_mode,
+            fixed_alpha=args.ss_ratio,
+            temp=args.temp,
+            topk=args.num_select,
+            suit_raw=suit_score,
+            stab_raw=stab_score,
+        )
+        test_time_tuning(model, images, suit_score.detach(), stab_score.detach(), optimizer, scaler, args, i, alpha)
         with torch.no_grad():
             tuned_outputs = model(images)
-            
-        suit_n  = (suit_score  - suit_score.min())  / (suit_score.max()  - suit_score.min()  + 1e-8)
-        stab_n = (stab_score - stab_score.min()) / (stab_score.max() - stab_score.min() + 1e-8)
-        score = args.ss_ratio * suit_n + (1-args.ss_ratio) * stab_n
+
+        score = combine_ss(suit_n_all, stab_n_all, alpha)
         weight_pred = torch.nn.functional.softmax(score/args.temp, dim=-1)
         tta_output = torch.bmm(weight_pred.unsqueeze(0).unsqueeze(-1).transpose(1, 2), tuned_outputs.unsqueeze(0)).squeeze(1)
 
@@ -504,6 +535,23 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
         tpt_acc1, _ = accuracy(tta_output, target, topk=(1, 5))
        
         tpt1.update(tpt_acc1[0], images.size(0))
+
+        pred_label = int(tta_output.argmax(dim=-1).flatten()[0].item())
+        target_label = int(target.flatten()[0].item())
+        trace = {
+            "index": int(i),
+            "target": target_label,
+            "pred": pred_label,
+            "correct": pred_label == target_label,
+            "alpha": round(float(alpha.detach().float().cpu().item()), 6),
+            "r_suit": round(float(r_suit.detach().float().cpu().item()), 6),
+            "r_stab": round(float(r_stab.detach().float().cpu().item()), 6),
+            "mode": args.alpha_mode,
+            "eps": float(args.eps),
+            "ss_ratio": float(args.ss_ratio),
+        }
+        args.alpha_trace_file.write(json.dumps(trace) + "\n")
+        args.alpha_trace_file.flush()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -560,4 +608,8 @@ if __name__ == '__main__':
                         help="method for computing suitability weights: 'sim' (cosine similarity) or 'density' (inverse mean kNN distance)")
     parser.add_argument('--ss_ratio', type=float, default=0.4,
                         help='weighting ratio to combine suitability and stability scores')
+    parser.add_argument('--alpha_mode', type=str, default='fixed', choices=list(ALPHA_MODES),
+                        help='per-image SS trade-off; fixed reproduces ss_ratio')
+    parser.add_argument('--max_samples', type=int, default=0,
+                        help='evaluation cap on the number of test images (0 = full set)')
     main()
